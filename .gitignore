@@ -1,0 +1,8 @@
+old
+prove
+.venv
+.vscode
+.DS_Store
+*.nxsl
+trust_anchors
+__pycache__

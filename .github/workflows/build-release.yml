@@ -1,0 +1,127 @@
+name: Nexs Ledger Release Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Four-component release version (N.N.N.N)
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*.*.*.*'
+
+permissions:
+  contents: read
+
+env:
+  NEXS_AUTO_ACCEPT_SYSTEM: '1'
+  NEXS_AUTO_ACCEPT_PIP: '1'
+  NEXS_AUTO_ACCEPT_CONTAINER: '1'
+  NEXS_REQUIRE_PINNED_IMAGE: '1'
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: macos-x86_64, runner: macos-15-intel, shell: bash}
+          - {target: macos-arm64, runner: macos-15, shell: bash}
+          - {target: linux-x86_64, runner: ubuntu-24.04, shell: bash}
+          - {target: linux-aarch64, runner: ubuntu-24.04-arm, shell: bash}
+          - {target: linux-musl-x86_64, runner: ubuntu-24.04, shell: bash}
+          - {target: linux-musl-aarch64, runner: ubuntu-24.04-arm, shell: bash}
+          - {target: windows-x86_64, runner: windows-2025-vs2026, shell: pwsh}
+          - {target: windows-arm64, runner: windows-11-vs2026-arm, shell: pwsh}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    env:
+      RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+      NEXS_NO_PUBLISH: '1'
+      NEXS_ARTIFACT_DIR: ${{ runner.temp }}/nexs-target-artifact
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12.3'
+          cache: pip
+          cache-dependency-path: nexs_build_tools/requirements-build.txt
+      - name: Verify version
+        run: |
+          python - <<'PY'
+          import os,re
+          v=os.environ['RELEASE_VERSION'].removeprefix('v')
+          if not re.fullmatch(r'\d+\.\d+\.\d+\.\d+',v): raise SystemExit(f'invalid release version: {v!r}')
+          with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as f: f.write(f'RELEASE_VERSION={v}\n')
+          PY
+      - name: Independent build-kit checksum audit
+        if: runner.os != 'Windows'
+        run: sha256sum --strict --check BUILD_KIT_SHA256SUMS
+      - name: Build-tool self-test
+        run: python test.py
+      - name: Build Unix target
+        if: runner.os != 'Windows'
+        run: chmod +x nexs_build_tools/*.sh && ./nexs_build_tools/build_release.sh -V "$RELEASE_VERSION" -t "${{ matrix.target }}"
+      - name: Verify Unix target archive
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x nexs_build_tools/*.sh
+          python nexs_build_tools/nexs_build_core.py verify-archive --archive "$RUNNER_TEMP/nexs-target-artifact/${{ matrix.target }}-$RELEASE_VERSION.tar.gz" --target "${{ matrix.target }}" --version "$RELEASE_VERSION"
+      - name: Build Windows target
+        if: runner.os == 'Windows'
+        run: .\nexs_build_tools\build_release.ps1 -V "$env:RELEASE_VERSION" -Target "${{ matrix.target }}" -NoPublish -ArtifactOut "$env:RUNNER_TEMP\nexs-target-artifact"
+      - name: Verify Windows target archive
+        if: runner.os == 'Windows'
+        run: |
+          python nexs_build_tools/nexs_build_core.py verify-archive --archive "$env:RUNNER_TEMP\nexs-target-artifact\${{ matrix.target }}-$env:RELEASE_VERSION.zip" --target "${{ matrix.target }}" --version "$env:RELEASE_VERSION"
+      - name: Upload verified target archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nexs-${{ matrix.target }}-${{ env.RELEASE_VERSION }}
+          path: ${{ runner.temp }}/nexs-target-artifact/*${{ env.RELEASE_VERSION }}.*
+          if-no-files-found: error
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12.3'
+      - name: Normalize version
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          case "$VERSION" in [0-9]*.[0-9]*.[0-9]*.[0-9]*) ;; *) echo "invalid release version: $VERSION" >&2; exit 1 ;; esac
+          echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: gathered
+      - name: Build complete release from verified target archives
+        run: |
+          mkdir -m 700 -p gathered_flat release
+          find gathered -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec cp -p {} gathered_flat/ \;
+          sha256sum --strict --check BUILD_KIT_SHA256SUMS
+          python nexs_build_tools/nexs_build_core.py audit-kit --root . --checksums BUILD_KIT_SHA256SUMS
+          python nexs_build_tools/nexs_build_core.py audit-tools --tools-dir nexs_build_tools --checksums nexs_build_tools/BUILD_TOOLS_SHA256SUMS
+          python nexs_build_tools/nexs_build_core.py assemble-archives --archives gathered_flat --release release --version "$RELEASE_VERSION"
+          python nexs_build_tools/nexs_build_core.py verify-release --release release --version "$RELEASE_VERSION" --require-all
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nexs-complete-release-${{ env.RELEASE_VERSION }}
+          path: release/
+          if-no-files-found: error

@@ -1,0 +1,15 @@
+# Exact build graph. CPython 3.12.x is the release baseline.
+# Nuitka 4.2.2 is an sdist on PyPI and is verified by its trusted SHA-256 in
+# nexs_build_core.py before installation. Setuptools is pinned because the
+# Nuitka sdist must be built without network access/build-isolation fetching.
+Nuitka==4.2.2
+cryptography==48.0.1
+cffi==2.1.1
+pycparser==2.23
+ordered-set==4.1.0
+setuptools==83.0.0
+argon2-cffi==23.1.0
+argon2-cffi-bindings==21.2.0
+ 
+ 
+ 

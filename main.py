@@ -1406,6 +1406,41 @@ def PREF_run_language_probe(command: list[str]) -> str:
     return result.stdout.strip()
 
 
+def PREF_running_as_compiled_binary() -> bool:
+    """Return True when running as a frozen/Nuitka-compiled standalone binary.
+
+    In that mode ``sys.executable`` refers to this program's own compiled
+    binary rather than a Python interpreter, so code that spawns
+    ``[sys.executable, "-c", ...]`` to run a one-off Python snippet must not
+    assume that trick still works.
+    """
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+
+
+def PREF_self_test_success_probe_command() -> list[str]:
+    """Return a bounded, portable command that prints 'Italian' and exits 0.
+
+    Used only to smoke-test PREF_run_language_probe itself during self-test.
+    """
+    if not PREF_running_as_compiled_binary():
+        return [sys.executable, "-c", "print('Italian')"]
+    if os.name == "nt":
+        return ["cmd.exe", "/d", "/c", "echo Italian"]
+    return ["/bin/sh", "-c", "printf Italian"]
+
+
+def PREF_self_test_failure_probe_command() -> list[str]:
+    """Return a bounded, portable command that exits with a non-zero status.
+
+    Used only to smoke-test PREF_run_language_probe itself during self-test.
+    """
+    if not PREF_running_as_compiled_binary():
+        return [sys.executable, "-c", "import sys; sys.exit(3)"]
+    if os.name == "nt":
+        return ["cmd.exe", "/d", "/c", "exit 3"]
+    return ["/bin/sh", "-c", "exit 3"]
+
+
 def PREF_detect_keyboard_language() -> str:
     """Detect the active keyboard/input-source language, with deterministic fallbacks."""
     probes: list[str] = []
@@ -4441,7 +4476,21 @@ def PREF_self_test_trust_anchor(identity: dict[str, Any]) -> None:
     original_override = PREF_RUNTIME_TRUST_ANCHOR_DIRECTORY_OVERRIDE
     try:
         with tempfile.TemporaryDirectory(prefix="nexs_anchor_") as temp_directory:
-            PREF_RUNTIME_TRUST_ANCHOR_DIRECTORY_OVERRIDE = temp_directory
+            # The trust-anchor directory and the workspace directory must be
+            # kept separate: PREF_load_trust_anchors() treats every
+            # non-hidden entry in the anchor directory as an anchor file and
+            # fails closed on anything else (including a directory). If the
+            # workspace were created directly inside temp_directory, its own
+            # physical directory (nxsl_<digest>.nxsl, created by
+            # PREF_create_workspace via os.makedirs) would sit alongside the
+            # anchor file and make every subsequent PREF_load_trust_anchors()
+            # call in this test fail with "unsafe entry", even the ones that
+            # are supposed to succeed.
+            anchor_directory = os.path.join(temp_directory, "trust_anchors")
+            workspace_directory = os.path.join(temp_directory, "workspace")
+            os.makedirs(anchor_directory, exist_ok=False)
+            os.makedirs(workspace_directory, exist_ok=False)
+            PREF_RUNTIME_TRUST_ANCHOR_DIRECTORY_OVERRIDE = anchor_directory
             PREF_RUNTIME_TRUST_ANCHORS = None
 
             user_credentials = {
@@ -4451,7 +4500,7 @@ def PREF_self_test_trust_anchor(identity: dict[str, Any]) -> None:
                 "username_fingerprint": PREF_sha256_text("anchor-user"),
             }
             workspace, manifest, seed = PREF_create_workspace(
-                "anchored", temp_directory, user_credentials, identity
+                "anchored", workspace_directory, user_credentials, identity
             )
             loaded, public_key = PREF_load_manifest(workspace, "anchored")
 
@@ -4538,7 +4587,7 @@ def PREF_self_test_trust_anchor(identity: dict[str, Any]) -> None:
                 PREF_RUNTIME_TRUST_ANCHORS = None
                 PREF_load_trust_anchors()
 
-            stray_path = os.path.join(temp_directory, "stray.txt")
+            stray_path = os.path.join(anchor_directory, "stray.txt")
             with open(stray_path, "w", encoding="utf-8") as stray:
                 stray.write("not an anchor")
             PREF_RUNTIME_TRUST_ANCHORS = None
@@ -4550,7 +4599,7 @@ def PREF_self_test_trust_anchor(identity: dict[str, Any]) -> None:
             PREF_RUNTIME_TRUST_ANCHORS = None
             PREF_load_trust_anchors()
 
-            dot_path = os.path.join(temp_directory, ".DS_Store")
+            dot_path = os.path.join(anchor_directory, ".DS_Store")
             with open(dot_path, "w", encoding="utf-8") as dot:
                 dot.write("ignore me")
             PREF_RUNTIME_TRUST_ANCHORS = None
@@ -4816,8 +4865,8 @@ def PREF_self_test_edge_cases(identity: dict[str, Any]) -> None:
         PREF_self_test_check(PREF_map_keyboard_identifier_to_language("('xkb', 'us')") == "eng", "XKB US source mapping")
         PREF_self_test_check(PREF_map_keyboard_identifier_to_language("") == "", "empty keyboard identifier is unresolved")
         PREF_self_test_check(PREF_detect_keyboard_language() in {"", "ita", "eng"}, "host keyboard detection returns only supported states")
-        PREF_self_test_check(PREF_run_language_probe([sys.executable, "-c", "print('Italian')"]) == "Italian", "bounded language probe works")
-        PREF_self_test_check(PREF_run_language_probe([sys.executable, "-c", "import sys; sys.exit(3)"]) == "", "failed language probe returns empty")
+        PREF_self_test_check(PREF_run_language_probe(PREF_self_test_success_probe_command()) == "Italian", "bounded language probe works")
+        PREF_self_test_check(PREF_run_language_probe(PREF_self_test_failure_probe_command()) == "", "failed language probe returns empty")
 
         PREF_self_test_check(PREF_canonical_json({"b": 1, "a": 2}) == b'{"a":2,"b":1}', "canonical JSON sort order")
         PREF_self_test_expect_failure(PREF_canonical_json, "NaN rejected", {"x": float("nan")})

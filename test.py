@@ -369,13 +369,25 @@ test.py - Benchmark / regression harness for main.py
 
 Usage:
     python3 test.py [NUM_OPERATIONS]
+    python3 test.py --binary PATH_TO_COMPILED_EXECUTABLE [--source PATH_TO_MAIN_PY]
 
-Loads main.py as a module, creates a temporary signed workspace,
-commits NUM_OPERATIONS signed operations through the public
-PREF_commit_operation() API, verifies the full hash chain both
-in-memory and from a cold reload, and prints timing statistics.
+Source mode (default):
+    Loads main.py as a module, creates a temporary signed workspace,
+    commits NUM_OPERATIONS signed operations through the public
+    PREF_commit_operation() API, verifies the full hash chain both
+    in-memory and from a cold reload, and prints timing statistics.
+    Default NUM_OPERATIONS is 100.
 
-Default NUM_OPERATIONS is 100.
+Compiled-binary mode (--binary):
+    Exercises an already-built standalone executable (e.g. the
+    "nexs_ledger"/"nexs_ledger.exe" produced by nexs_build_tools)
+    instead of importing main.py as a Python module: it runs the
+    binary's own "--self-test" and "--build-identity" entry points
+    out-of-process and, when --source is also given, checks the
+    reported program hash against that source file. This lets the
+    same test.py validate either the source tree or a compiled
+    artifact without requiring a second, duplicate compiled binary
+    just to have something to run the check against.
 
 The script never touches the real workspace directory or the real
 trust-anchor directory: both are redirected inside a tempdir.
@@ -383,9 +395,176 @@ trust-anchor directory: both are redirected inside a tempdir.
 
 from __future__ import annotations
 
+# ---------------------------------------------------------------------------
+# BEGIN: standalone-bundle safety guard (added fix)
+#
+# The Nuitka --standalone artifacts produced by nexs_build_tools'
+# build_release.sh are NOT single-file executables. Their "package/"
+# directory (and the published .tar.gz/.zip) ships a full CPython
+# runtime next to the compiled nexs_ledger launcher: native extension
+# modules (_posixsubprocess.so, _blake2.so, _hashlib.so, ...),
+# libpython3.12.dylib / libpython3.12.so, python312.dll on Windows,
+# and so on. All of these are compiled against the exact CPython minor
+# version used at build time.
+#
+# CPython prepends the script's own directory to sys.path[0] by
+# default. Running test.py from inside that directory with a
+# *different* Python minor version therefore makes the interpreter
+# dlopen those mismatched native modules in place of its own stdlib,
+# which surfaces as "symbol not found in flat namespace
+# '__PyLong_AsInt'" (macOS), an "undefined symbol" load error (Linux),
+# or a missing-export error from pythonXY.dll (Windows). A secondary
+# symptom is that hashlib construction for blake2b/blake2s fails with
+# "unsupported hash type".
+#
+# The check below runs before any shadowable stdlib import (hashlib,
+# subprocess, ssl, ...). It uses only the interpreter's own built-ins
+# (sys, open, builtins) and the byte-level primitives, because a
+# same-named .py or .so file dropped next to test.py could already have
+# replaced any ordinary module before our guard would have had a
+# chance to execute. It is a strict no-op when test.py is run from a
+# normal source tree or virtualenv (no native extension and no
+# libpython is ever located beside it), and also when Python is
+# invoked with -P or PYTHONSAFEPATH=1.
+# ---------------------------------------------------------------------------
+import sys as _sys
+
+
+def _enforce_bundle_safety() -> None:
+    # -P / PYTHONSAFEPATH=1 have already neutralised sys.path[0];
+    # nothing to check. sys.flags.safe_path exists on Python 3.11+ and
+    # is absent on older interpreters, hence getattr.
+    if getattr(_sys.flags, "safe_path", False):
+        return
+    if not _sys.path:
+        return
+    base = _sys.path[0] or "."
+    if not base:
+        return
+
+    # Forward slashes are accepted as path separators by the Windows
+    # kernel API, so a single separator spelling works on every
+    # platform CPython supports. The probe uses os.path-free string
+    # concatenation on purpose; see the comment block above.
+    def has(name: str) -> bool:
+        try:
+            with open(base + "/" + name, "rb"):
+                return True
+        except OSError:
+            return False
+
+    # Signal 1: our own compiled launcher, shipped beside test.py in
+    # every release package for every target.
+    suspicious = has("nexs_ledger") or has("nexs_ledger.exe")
+
+    # Signal 2: a CPython native-extension or libpython shared object
+    # in the same directory as this script. A normal source tree or a
+    # virtualenv root never contains these (venvs keep them under
+    # lib/pythonX.Y/lib-dynload/ and .dylibs under the interpreter
+    # prefix), so their presence here is the on-disk signature of a
+    # --standalone drop. We probe a curated list of well-known names
+    # rather than listing the directory, so this guard never imports
+    # os or os.path.
+    if not suspicious:
+        stems = (
+            "_posixsubprocess", "_blake2", "_hashlib", "_socket",
+            "_ssl", "_ctypes", "_decimal", "_struct", "_pickle",
+            "_random",
+        )
+        tags = (
+            "", ".abi3",
+            ".cpython-310", ".cpython-311",
+            ".cpython-312", ".cpython-313",
+            ".cp310-win_amd64", ".cp311-win_amd64",
+            ".cp312-win_amd64", ".cp313-win_amd64",
+        )
+        exts = (".so", ".pyd", ".dylib", ".dll")
+        for stem in stems:
+            for tag in tags:
+                for ext in exts:
+                    if has(stem + tag + ext):
+                        suspicious = True
+                        break
+                if suspicious:
+                    break
+            if suspicious:
+                break
+
+    if not suspicious:
+        # libpython* shared object by explicit name, plus the small set
+        # of pythonXY.dll spellings seen on Windows.
+        for name in (
+            "libpython3.so",
+            "libpython3.10.so", "libpython3.11.so",
+            "libpython3.12.so", "libpython3.13.so",
+            "libpython3.10.dylib", "libpython3.11.dylib",
+            "libpython3.12.dylib", "libpython3.13.dylib",
+            "python3.dll",
+            "python310.dll", "python311.dll",
+            "python312.dll", "python313.dll", "python314.dll",
+        ):
+            if has(name):
+                suspicious = True
+                break
+
+    if not suspicious:
+        return
+
+    exe = _sys.executable or "python"
+    script = _sys.argv[0] if _sys.argv else "test.py"
+    maj, minr = _sys.version_info[:2]
+
+    _sys.stderr.write(
+        "ERROR: test.py is being run from inside a compiled\n"
+        "       Nexs-Scratch-Ledger release bundle, but the Python\n"
+        "       interpreter that is executing it has not been placed in\n"
+        "       safe-path mode.\n"
+        "\n"
+        "       The extracted release directory ships a full CPython 3.12\n"
+        "       runtime next to this script (_posixsubprocess.*, _blake2.*,\n"
+        "       _hashlib.*, libpython3.12.*, ...). CPython prepends the\n"
+        "       script's own directory to sys.path[0], so the interpreter\n"
+        f"       currently running this file (CPython {maj}.{minr}) would\n"
+        "       dlopen those mismatched native modules before its own\n"
+        "       stdlib, producing missing-symbol errors or silent stdlib\n"
+        "       shadowing.\n"
+        "\n"
+        "       Re-run with the script's directory excluded from sys.path:\n"
+        "\n"
+        f"           {exe} -P {script}\n"
+        "               (portable; requires Python 3.11+)\n"
+        f"           PYTHONSAFEPATH=1 {exe} {script}\n"
+        "               (POSIX shells: sh, bash, zsh, ...)\n"
+        f"           set PYTHONSAFEPATH=1 && {exe} {script}\n"
+        "               (cmd.exe)\n"
+        f"           $env:PYTHONSAFEPATH='1'; & \"{exe}\" \"{script}\"\n"
+        "               (PowerShell)\n"
+        "\n"
+        "       Alternatively, exercise the packaged binary directly:\n"
+        "\n"
+        "           ./nexs_ledger --self-test\n"
+        "           ./nexs_ledger --build-identity\n"
+        "\n"
+        "       Or run the packaged run-test.sh wrapper, which already\n"
+        "       invokes this script in safe-path mode.\n"
+    )
+    _sys.exit(2)
+
+
+_enforce_bundle_safety()
+del _enforce_bundle_safety
+del _sys
+# ---------------------------------------------------------------------------
+# END: standalone-bundle safety guard
+# ---------------------------------------------------------------------------
+
+
+import hashlib
 import importlib.util
+import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -481,6 +660,75 @@ def debug_temp_dir(prefix: str):
     finally:
         ask_and_export_debug(tmp)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_against_binary(binary: str, source: str | None) -> int:
+    """Exercise an already-compiled executable instead of importing main.py.
+
+    This does not (and cannot, from outside the process) replay the full
+    workspace/ledger benchmark that `run()` performs against the Python
+    source: a standalone build only exposes its "--self-test" and
+    "--build-identity" entry points on the command line. What it *can*
+    verify, against the real shipped artifact, is that both of those
+    succeed and, optionally, that the compiled program hash matches a
+    given trusted source file.
+    """
+    binary_path = Path(binary).resolve()
+    if not binary_path.is_file():
+        raise SystemExit(f"ERROR: compiled binary not found at {binary_path}")
+
+    print("=" * 68)
+    print("Nexs-Scratch-Ledger  ->  test.py (compiled binary mode)")
+    print("=" * 68)
+    print(f"Binary                : {binary_path}")
+
+    print("-" * 68)
+    print("Running compiled --self-test ...")
+    self_test = subprocess.run(
+        [str(binary_path), "--self-test"], capture_output=True, text=True
+    )
+    if self_test.stdout:
+        sys.stdout.write(self_test.stdout)
+    if self_test.stderr:
+        sys.stderr.write(self_test.stderr)
+    if self_test.returncode != 0:
+        print(f"FAILED: compiled self-test exited with status {self_test.returncode}")
+        return 1
+
+    print("-" * 68)
+    print("Querying compiled --build-identity ...")
+    identity_probe = subprocess.run(
+        [str(binary_path), "--build-identity"], capture_output=True, text=True
+    )
+    if identity_probe.returncode != 0:
+        print(f"FAILED: --build-identity exited with status {identity_probe.returncode}")
+        if identity_probe.stderr:
+            sys.stderr.write(identity_probe.stderr)
+        return 1
+    try:
+        identity = json.loads(identity_probe.stdout)
+    except json.JSONDecodeError as exc:
+        print(f"FAILED: --build-identity did not return valid JSON: {exc}")
+        return 1
+
+    print(f"Program version       : {identity.get('program_version_hash')}")
+    print(f"Program hash          : {str(identity.get('program_hash'))[:32]}...")
+    print(f"Runtime fingerprint   : {str(identity.get('runtime_fingerprint'))[:32]}...")
+
+    if source is not None:
+        source_path = Path(source).resolve()
+        if not source_path.is_file():
+            raise SystemExit(f"ERROR: source not found at {source_path}")
+        source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        if identity.get("program_hash") != source_hash:
+            print("FAILED: compiled program_hash does not match the given source file")
+            return 1
+        print(f"  matches source     : {source_path}")
+
+    print("=" * 68)
+    print("TEST PASSED (compiled binary)")
+    print("=" * 68)
+    return 0
 
 
 def run(num_operations: int) -> int:
@@ -638,9 +886,29 @@ def run(num_operations: int) -> int:
     return 0
 
 
+def _extract_flag_value(argv: list[str], flag: str) -> tuple[str | None, list[str]]:
+    """Pull `flag VALUE` out of argv, returning (value, remaining argv)."""
+    if flag not in argv:
+        return None, argv
+    index = argv.index(flag)
+    if index + 1 >= len(argv):
+        raise SystemExit(f"ERROR: {flag} requires a path argument")
+    value = argv[index + 1]
+    remaining = argv[:index] + argv[index + 2:]
+    return value, remaining
+
+
 def main() -> int:
-    num_operations = parse_args(sys.argv)
+    argv = sys.argv[1:]
+    binary, argv = _extract_flag_value(argv, "--binary")
+    source, argv = _extract_flag_value(argv, "--source")
+    if source is not None and binary is None:
+        raise SystemExit("ERROR: --source is only valid together with --binary")
+
     try:
+        if binary is not None:
+            return run_against_binary(binary, source)
+        num_operations = parse_args([sys.argv[0], *argv])
         return run(num_operations)
     except KeyboardInterrupt:
         print("\nInterrupted by user.")

@@ -1,0 +1,4 @@
+# Runtime dependencies for main.py (Nexs Scratch Ledger)
+# Install with: pip install -r requirements.txt
+cryptography>=41
+argon2-cffi>=23

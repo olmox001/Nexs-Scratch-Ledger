@@ -6,3 +6,11 @@ prove
 *.nxsl
 trust_anchors
 __pycache__
+build
+release
+*full4ai.txt
+.presstoai.json
+.git
+nexs_debug_*
+BUILD_KIT_SHA256SUMS
+BUILD_TOOLS_SHA256SUMS

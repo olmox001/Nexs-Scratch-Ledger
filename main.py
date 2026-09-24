@@ -501,6 +501,9 @@ PREF_MAX_DATASET_ID_CHARS: int = 128
 PREF_MAX_DATASET_PATH_COMPONENTS: int = 128
 PREF_MAX_EXTERNAL_RESOURCES_PER_PAYLOAD: int = 256
 
+PREF_MIN_USERNAME_CHARS: int = 12
+PREF_MIN_PASSWORD_CHARS: int = 12
+
 # Argon2id parameters. memory_cost is expressed in KiB, matching the
 # argon2-cffi API. Defaults correspond to the OWASP "second recommended
 # option" (m=64 MiB, t=3, p=1) and provide a memory-hard barrier
@@ -561,6 +564,9 @@ PREF_TRANSLATIONS: dict[str, dict[str, str]] = {
         "username_prompt": "Nome utente (lasciare vuoto insieme alla password per la modalità generica): ",
         "password_prompt": "Password (lasciare vuoto insieme al nome utente per la modalità generica): ",
         "credentials_partial": "ERROR: nome utente e password devono essere entrambi compilati oppure entrambi vuoti.",
+        "credentials_too_short": "ERROR: nome utente e password devono avere almeno 12 caratteri (modalità utente).",
+        "credentials_username_too_short": "ERROR: il nome utente deve avere almeno 12 caratteri.",
+        "credentials_password_too_short": "ERROR: la password deve avere almeno 12 caratteri.",
         "generic_mode": "Modalità identità generica attiva: la scrittura non richiede credenziali personali.",
         "generic_mode_warning": "ATTENZIONE SICUREZZA: la chiave generica deriva da 0 + hash programma ed è quindi pubblicamente ricostruibile; non fornisce autenticità segreta di un utente.",
         "credential_mode": "Modalità identità utente attiva.",
@@ -908,6 +914,9 @@ PREF_TRANSLATIONS: dict[str, dict[str, str]] = {
         "username_prompt": "Username (leave empty together with password for generic mode): ",
         "password_prompt": "Password (leave empty together with username for generic mode): ",
         "credentials_partial": "ERROR: username and password must both be filled or both be empty.",
+        "credentials_too_short": "ERROR: username and password must be at least 12 characters (user mode).",
+        "credentials_username_too_short": "ERROR: username must be at least 12 characters.",
+        "credentials_password_too_short": "ERROR: password must be at least 12 characters.",
         "generic_mode": "Generic identity mode active: writing does not require personal credentials.",
         "generic_mode_warning": "SECURITY WARNING: the generic key is derived from 0 + the program hash and is therefore publicly reconstructable; it does not provide secret user authenticity.",
         "credential_mode": "User credential mode active.",
@@ -1311,21 +1320,41 @@ def PREF_print_message(key: str, *args: Any, **kwargs: Any) -> None:
 
 
 def PREF_input(prompt: str = "") -> str:
-    """Portable input with a guaranteed prompt flush before blocking."""
+    """Portable input: long prompts go on their own line to avoid wrap/edit confusion."""
     PREF_flush_streams()
+    if prompt and not prompt.endswith("\n"):
+        # Prompt on its own line; user types on the next line.
+        try:
+            print(prompt.rstrip(), flush=True)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        return input("> ")
     return input(prompt)
 
 
 def PREF_getpass(prompt: str = "") -> str:
-    """Portable getpass with a guaranteed prompt flush and a safe fallback."""
+    """Portable getpass with the same one-prompt-per-line layout as PREF_input."""
     PREF_flush_streams()
     try:
-        secret = getpass.getpass(prompt)
+        if prompt and not prompt.endswith("\n"):
+            try:
+                print(prompt.rstrip(), flush=True)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            secret = getpass.getpass("> ")
+        else:
+            secret = getpass.getpass(prompt)
     except (OSError, io.UnsupportedOperation):
         return PREF_input(prompt)
     PREF_flush_streams()
     return secret
 
+def PREF_try_enable_readline() -> None:
+    """Best-effort: enable line editing where the platform supports it."""
+    try:
+        import readline  # noqa: F401
+    except ImportError:
+        pass
 
 def PREF_map_keyboard_identifier_to_language(identifier: str) -> str:
     """Map a concrete keyboard/input-source identifier to a supported program language."""
@@ -4048,45 +4077,83 @@ def PREF_validate_credentials(credentials: dict[str, Any]) -> None:
 def PREF_collect_credentials() -> dict[str, Any]:
     """Read username and password (or generic mode) from the interactive session.
 
-    Kept as a small named helper so PREF_main stays focused on orchestration
-    and so the credential contract is testable in isolation. Blank username
-    AND blank password select generic mode; any other mismatch is rejected
-    with a localized error and re-prompted.
+    Blank username AND blank password select generic mode.
+    In user mode both fields are required; only the password must meet
+    the minimum length policy.
+
+    Retry policy:
+      - absent password (username present, password empty): full re-prompt
+        (username + password), so a mistyped username can still be corrected;
+      - other password validation failures (too short / too long): keep the
+        already-accepted username and re-prompt only the password;
+      - invalid username (over max length): discard it and re-prompt.
     """
+    saved_username: str | None = None
+    saved_normalized: str | None = None
+
     for _attempt in range(PREF_MAX_INPUT_ATTEMPTS):
-        try:
-            username = PREF_input(PREF_translate("username_prompt"))
-        except EOFError as exc:
-            raise RuntimeError(PREF_translate("err_credentials_input_eof")) from exc
-        try:
-            password = PREF_getpass(PREF_translate("password_prompt"))
-        except EOFError as exc:
-            raise RuntimeError(PREF_translate("err_credentials_input_eof")) from exc
-        username_stripped = username.strip()
-        if not username_stripped and not password:
-            return {
-                "username": "",
-                "password": "",
-                "generic": True,
-                "username_fingerprint": "0",
-            }
-        if username_stripped and password:
-            normalized = PREF_normalize_username(username)
+        # ----- username (only if not already accepted) -----
+        if saved_username is None:
+            try:
+                raw_username = PREF_input(PREF_translate("username_prompt"))
+            except EOFError as exp:
+                raise RuntimeError(PREF_translate("err_credentials_input_eof")) from exp
+
+            username_stripped = raw_username.strip()
+
+            if not username_stripped:
+                try:
+                    password = PREF_getpass(PREF_translate("password_prompt"))
+                except EOFError as exp:
+                    raise RuntimeError(PREF_translate("err_credentials_input_eof")) from exp
+                if not password:
+                    return {
+                        "username": "",
+                        "password": "",
+                        "generic": True,
+                        "username_fingerprint": "0",
+                    }
+                PREF_print(PREF_translate("credentials_partial"))
+                continue
+
+            normalized = PREF_normalize_username(raw_username)
             if len(normalized) > PREF_MAX_USERNAME_CHARS:
                 PREF_print(PREF_translate("credentials_partial"))
                 continue
-            if len(password) > PREF_MAX_PASSWORD_CHARS:
-                PREF_print(PREF_translate("credentials_partial"))
-                continue
-            return {
-                "username": username,
-                "password": password,
-                "generic": False,
-                "username_fingerprint": PREF_sha256_text(normalized),
-            }
-        PREF_print(PREF_translate("credentials_partial"))
-    raise RuntimeError(PREF_translate("err_credentials_limit"))
+            # no minimum length on username
 
+            saved_username = raw_username
+            saved_normalized = normalized
+
+        # ----- password (username already accepted) -----
+        try:
+            password = PREF_getpass(PREF_translate("password_prompt"))
+        except EOFError as exp:
+            raise RuntimeError(PREF_translate("err_credentials_input_eof")) from exp
+
+        # Absent password → full retry (drop username)
+        if not password:
+            PREF_print(PREF_translate("credentials_partial"))
+            saved_username = None
+            saved_normalized = None
+            continue
+
+        if len(password) > PREF_MAX_PASSWORD_CHARS:
+            PREF_print(PREF_translate("credentials_partial"))
+            continue
+
+        if len(password) < PREF_MIN_PASSWORD_CHARS:
+            PREF_print(PREF_translate("credentials_password_too_short"))
+            continue
+
+        return {
+            "username": saved_username,
+            "password": password,
+            "generic": False,
+            "username_fingerprint": PREF_sha256_text(saved_normalized),
+        }
+
+    raise RuntimeError(PREF_translate("err_credentials_limit"))
 
 def PREF_scan_workspace_logical_name(path: str) -> str:
     """Read only the display name from a manifest; final trust is checked later."""
@@ -5170,6 +5237,7 @@ def PREF_main() -> None:
     global PREF_RUNTIME_CREDENTIALS, PREF_RUNTIME_WRITE_CONTEXT
 
     detected_language = PREF_detect_keyboard_language()
+    PREF_try_enable_readline()
     PREF_set_language(detected_language or "eng")
 
     if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
